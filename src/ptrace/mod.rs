@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::IoSlice;
+use std::io::{IoSlice, IoSliceMut};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use nix::errno::Errno;
 use nix::sys::mman::{MapFlags, ProtFlags};
 use nix::sys::signal::Signal;
-use nix::sys::uio::{process_vm_writev, RemoteIoVec};
+use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
 use nix::sys::{ptrace, wait};
 use nix::unistd::Pid;
 use procfs::process::Task;
@@ -217,7 +217,7 @@ impl TracedProcess {
 
     #[instrument]
     fn syscall(&self, id: u64, args: &[u64]) -> Result<u64> {
-        trace!("run syscall {} {:?}", id, args);
+        trace!("run syscall {} {:X?}", id, args);
 
         self.with_protect(|thread| -> Result<u64> {
             let pid = Pid::from_raw(thread.pid);
@@ -244,7 +244,7 @@ impl TracedProcess {
                     return Err(anyhow!("too many arguments for a syscall"));
                 }
             }
-            trace!("setting regs for pid: {:?}, regs: {:?}", pid, regs);
+            trace!("setting regs for pid: {:?}, regs: {:X?}", pid, regs);
             ptrace::setregs(pid, regs)?;
 
             // We only support x86-64 platform now, so using hard coded `LittleEndian` here is ok.
@@ -268,7 +268,7 @@ impl TracedProcess {
 
             let regs = ptrace::getregs(pid)?;
 
-            trace!("returned: {:?}", regs.rax);
+            trace!("returned: {:X?}", regs.rax);
 
             Ok(regs.rax)
         })
@@ -291,7 +291,7 @@ impl TracedProcess {
     }
 
     #[instrument(skip(f))]
-    pub fn with_mmap<R, F: Fn(&Self, u64) -> Result<R>>(&self, len: u64, f: F) -> Result<R> {
+    pub fn with_mmap<R, F: FnMut(&Self, u64) -> Result<R>>(&self, len: u64, mut f: F) -> Result<R> {
         let addr = self.mmap(len, 0)?;
 
         let ret = f(self, addr)?;
@@ -330,15 +330,33 @@ impl TracedProcess {
         Ok(())
     }
 
-    #[instrument(skip(codes))]
-    pub fn run_codes<F: Fn(u64) -> Result<(u64, Vec<u8>)>>(&self, codes: F) -> Result<()> {
+    #[instrument]
+    pub fn read_mem(&self, addr: u64, content: &mut [u8]) -> Result<()> {
+        let pid = Pid::from_raw(self.pid);
+
+        let len = content.len();
+
+        process_vm_readv(
+            pid,
+            &mut [IoSliceMut::new(content)],
+            &[RemoteIoVec {
+                base: addr as usize,
+                len,
+            }],
+        )?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(capture, codes))]
+    pub fn run_codes<F: Fn(u64) -> Result<(u64, Vec<u8>)>>(&self, mut capture: Option<&mut [u8]>, codes: F) -> Result<()> {
         let pid = Pid::from_raw(self.pid);
 
         let regs = ptrace::getregs(pid)?;
         let (_, ins) = codes(regs.rip)?; // generate codes to get length
 
         self.with_mmap(ins.len() as u64 + 16, |_, addr| {
-            self.with_protect(|_| {
+            let protect_result = self.with_protect(|_| {
                 let (offset, ins) = codes(addr)?; // generate codes
 
                 let end_addr = addr + ins.len() as u64;
@@ -351,7 +369,7 @@ impl TracedProcess {
                 ptrace::setregs(pid, regs)?;
 
                 let regs = ptrace::getregs(pid)?;
-                info!("current registers: {:?}", regs);
+                info!("current registers: {:X?}", regs);
 
                 loop {
                     info!("run instructions");
@@ -363,16 +381,33 @@ impl TracedProcess {
 
                     let regs = ptrace::getregs(pid)?;
 
-                    info!("current registers: {:?}", regs);
+                    info!("current registers: {:X?}", regs);
                     match status {
                         wait::WaitStatus::Stopped(_, Signal::SIGTRAP) => {
                             break;
                         }
+                        wait::WaitStatus::Stopped(_, signal) => {
+                            match signal {
+                                Signal::SIGSEGV | Signal::SIGABRT | Signal::SIGILL | Signal::SIGBUS => {
+                                    error!("received fatal signal: {}", signal);
+                                    return Err(anyhow!("received fatal signal: {}", signal));
+                                }
+                                _ => {},
+                            }
+                        },
                         _ => info!("continue running replacers"),
                     }
                 }
                 Ok(())
-            })
+            });
+
+            if protect_result.is_ok() {
+                if let Some(ref mut capture) = capture {
+                    self.read_mem(addr, *capture)?;
+                }
+            }
+
+            protect_result
         })
     }
 }

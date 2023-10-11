@@ -6,6 +6,7 @@ mod utils;
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
+use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -16,14 +17,14 @@ use async_trait::async_trait;
 use derive_more::{Deref, DerefMut, From};
 pub use errors::{HookFsError as Error, Result};
 use fuser::*;
-use libc::{c_void, lgetxattr, llistxattr, lremovexattr, lsetxattr};
+use libc::{c_void, fgetxattr, fsetxattr, flistxattr, fremovexattr};
 use nix::dir;
 use nix::errno::Errno;
-use nix::fcntl::{open, readlink, renameat, OFlag};
+use nix::fcntl::{openat, renameat, OFlag, AtFlags};
 use nix::sys::{stat, statfs};
 use nix::unistd::{
-    close, fchownat, fsync, linkat, mkdir, symlinkat, truncate, unlink, AccessFlags, FchownatFlags,
-    Gid, LinkatFlags, Uid,
+    close, fchownat, fsync, linkat, symlinkat, ftruncate, AccessFlags, FchownatFlags,
+    Gid, LinkatFlags, Uid, UnlinkatFlags,
 };
 pub use reply::Reply;
 use reply::*;
@@ -44,7 +45,7 @@ macro_rules! inject {
                 .injector
                 .read()
                 .await
-                .inject(&Method::$method, $self.rebuild_path($path)?.as_path())
+                .inject(&Method::$method, $path)
                 .await?;
         }
     };
@@ -66,7 +67,7 @@ macro_rules! inject_with_fh {
     ($self:ident, $method:ident, $fh:ident) => {{
         let opened_files = $self.opened_files.read().await;
         if let Ok(file) = opened_files.get($fh as usize) {
-            let path = file.original_path().to_owned();
+            let path = file.path().to_owned();
             drop(opened_files);
             inject!($self, $method, &path);
         }
@@ -77,13 +78,12 @@ macro_rules! inject_write_data {
     ($self:ident, $fh:ident, $data:ident) => {{
         let opened_files = $self.opened_files.read().await;
         if let Ok(file) = opened_files.get($fh as usize) {
-            let path = file.original_path().to_owned();
             trace!("Write data before inject {:?}", $data);
             $self
                 .injector
                 .read()
                 .await
-                .inject_write_data($self.rebuild_path(path)?.as_path(), &mut $data)?;
+                .inject_write_data(file.path(), &mut $data)?;
             trace!("Write data after inject {:?}", $data);
         }
     }};
@@ -93,7 +93,7 @@ macro_rules! inject_with_dir_fh {
     ($self:ident, $method:ident, $fh:ident) => {{
         let opened_dirs = $self.opened_dirs.read().await;
         if let Ok(dir) = opened_dirs.get($fh as usize) {
-            let path = dir.original_path().to_owned();
+            let path = dir.path().to_owned();
             drop(opened_dirs);
             inject!($self, $method, &path);
         }
@@ -119,7 +119,7 @@ macro_rules! inject_attr {
                 .injector
                 .read()
                 .await
-                .inject_attr(&mut $attr, $self.rebuild_path($path)?.as_path());
+                .inject_attr(&mut $attr, $path);
         }
     };
 }
@@ -130,7 +130,7 @@ macro_rules! inject_reply {
             trace!("before inject {:?}", $reply);
             $self.injector.read().await.inject_reply(
                 &Method::$method,
-                $self.rebuild_path($path)?.as_path(),
+                $path,
                 &mut Reply::$reply_typ(&mut $reply),
             )?;
             trace!("after inject {:?}", $reply);
@@ -141,7 +141,6 @@ macro_rules! inject_reply {
 #[derive(Debug)]
 pub struct HookFs {
     mount_path: PathBuf,
-    original_path: PathBuf,
 
     enable_injection: AtomicBool,
 
@@ -153,6 +152,8 @@ pub struct HookFs {
 
     // map from inode to real path
     inode_map: RwLock<InodeMap>,
+
+    dir_handle: RawFd,
 }
 
 #[derive(Debug, Default)]
@@ -243,18 +244,18 @@ impl<T> FhMap<T> {
 #[derive(Debug)]
 pub struct Dir {
     dir: dir::Dir,
-    original_path: PathBuf,
+    path: PathBuf,
 }
 
 impl Dir {
     fn new<P: AsRef<Path>>(dir: dir::Dir, path: P) -> Dir {
         Dir {
             dir,
-            original_path: path.as_ref().to_owned(),
+            path: path.as_ref().to_owned(),
         }
     }
-    fn original_path(&self) -> &Path {
-        &self.original_path
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -275,18 +276,18 @@ impl std::ops::DerefMut for Dir {
 #[derive(Debug)]
 pub struct File {
     pub fd: RawFd,
-    original_path: PathBuf,
+    path: PathBuf,
 }
 
 impl File {
     fn new<P: AsRef<Path>>(fd: RawFd, path: P) -> File {
         File {
             fd,
-            original_path: path.as_ref().to_owned(),
+            path: path.as_ref().to_owned(),
         }
     }
-    fn original_path(&self) -> &Path {
-        &self.original_path
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -294,24 +295,24 @@ unsafe impl Send for Dir {}
 unsafe impl Sync for Dir {}
 
 impl HookFs {
-    pub fn new<P1: AsRef<Path>, P2: AsRef<Path>>(
+    pub fn new<P1: AsRef<Path>>(
         mount_path: P1,
-        original_path: P2,
         injector: MultiInjector,
+        dir_handle: RawFd,
     ) -> HookFs {
         let mut inode_map = InodeMap::from(HashMap::new());
-        inode_map.insert_path(1, original_path.as_ref());
+        inode_map.insert_path(1, PathBuf::from(mount_path.as_ref()));
 
         let inode_map = RwLock::new(inode_map);
 
         HookFs {
             mount_path: mount_path.as_ref().to_owned(),
-            original_path: original_path.as_ref().to_owned(),
             opened_files: RwLock::new(FhMap::from(Slab::new())),
             opened_dirs: RwLock::new(FhMap::from(Slab::new())),
             injector: RwLock::new(injector),
             inode_map,
             enable_injection: AtomicBool::from(false),
+            dir_handle,
         }
     }
 
@@ -331,17 +332,18 @@ impl HookFs {
         });
     }
 
-    pub fn rebuild_path<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
-        let path_tail = path.as_ref().strip_prefix(self.original_path.as_path())?;
-        let path = self.mount_path.join(path_tail);
-
-        Ok(path)
+    pub fn relative_path<P: AsRef<Path>>(&self, path: P) -> Result<PathBuf> {
+        let tail = path.as_ref().strip_prefix(self.mount_path.as_path())?;
+        let rel = PathBuf::from("./").join(tail);
+        Ok(rel.to_path_buf())
     }
 }
 
 impl HookFs {
     async fn get_file_attr(&self, path: &Path) -> Result<FileAttr> {
-        let mut attr = async_stat(path)
+        let rel = self.relative_path(path)?;
+
+        let mut attr = async_stat(self.dir_handle, &rel)
             .await
             .map(convert_libc_stat_to_fuse_stat)??;
 
@@ -358,7 +360,7 @@ impl AsyncFileSystemImpl for HookFs {
     fn init(&self) -> Result<()> {
         trace!("init");
 
-        stat::umask(stat::Mode::from_bits_truncate(0));
+        stat::umask(stat::Mode::empty());
 
         Ok(())
     }
@@ -381,7 +383,7 @@ impl AsyncFileSystemImpl for HookFs {
 
         let stat = self.get_file_attr(&path).await?;
 
-        trace!("insert ({}, {}) into inode_map", stat.ino, path.display());
+        debug!("insert ({}, {}) into inode_map", stat.ino, path.display());
         inode_map.insert_path(stat.ino, path.clone());
         inode_map.increase_ref(stat.ino);
         // TODO: support generation number
@@ -444,19 +446,23 @@ impl AsyncFileSystemImpl for HookFs {
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?;
 
-        async_lchown(path, uid, gid).await?;
+        let rel = self.relative_path(path)?;
+        async_fchownat(self.dir_handle, &rel, uid, gid).await?;
 
         if let Some(mode) = mode {
-            async_fchmodat(path, mode).await?;
+            async_fchmodat(self.dir_handle, &rel, mode).await?;
         }
 
         if let Some(size) = size {
-            async_truncate(path, size as i64).await?;
+            let fd = async_openat(self.dir_handle, &rel, OFlag::O_WRONLY, stat::Mode::empty()).await?;
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+            spawn_blocking(move || ftruncate(borrowed_fd, size as i64)).await??;
+            async_close(fd).await?;
         }
 
         let times = [convert_time(atime), convert_time(mtime)];
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
-        async_utimensat(cpath, times).await?;
+        let cpath = CString::new(rel.as_os_str().as_bytes())?;
+        async_utimensat(self.dir_handle, cpath, times).await?;
 
         let stat = self.get_file_attr(path).await?;
         trace!("return with {:?}", stat);
@@ -474,7 +480,8 @@ impl AsyncFileSystemImpl for HookFs {
         let inode_map = self.inode_map.read().await;
         let link_path = inode_map.get_path(ino)?;
 
-        let path = async_readlink(link_path).await?;
+        let rel_path = self.relative_path(link_path)?;
+        let path = async_readlinkat(self.dir_handle, &rel_path).await?;
 
         let path = CString::new(path.as_os_str().as_bytes())?;
 
@@ -505,12 +512,14 @@ impl AsyncFileSystemImpl for HookFs {
         let parent_path = inode_map.get_path(parent)?;
         let path = parent_path.join(&name);
         inject!(self, MKNOD, path.as_path());
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
 
-        trace!("mknod for {:?}", cpath);
+        let rel = self.relative_path(path.clone())?;
+        let rel_cpath = CString::new(rel.as_os_str().as_bytes())?;
 
-        async_mknod(cpath, mode, rdev as u64).await?;
-        async_lchown(&path, Some(uid), Some(gid)).await?;
+        trace!("mknod for {:?}", rel_cpath);
+
+        async_mknodat(self.dir_handle, rel_cpath, mode, rdev as u64).await?;
+        async_fchownat(self.dir_handle, &rel, Some(uid), Some(gid)).await?;
 
         let stat = self.get_file_attr(&path).await?;
         inode_map.insert_path(stat.ino, path.clone());
@@ -539,12 +548,13 @@ impl AsyncFileSystemImpl for HookFs {
             let parent_path = inode_map.get_path(parent)?;
             parent_path.join(&name)
         };
+        let rel = self.relative_path(path.clone())?;
 
         let mode = stat::Mode::from_bits_truncate(mode);
         trace!("create directory with mode: {:?}", mode);
-        async_mkdir(&path, mode).await?;
+        async_mkdirat(self.dir_handle, &rel, mode).await?;
         trace!("setting owner {}:{}", uid, gid);
-        async_lchown(&path, Some(uid), Some(gid)).await?;
+        async_fchownat(self.dir_handle, &rel, Some(uid), Some(gid)).await?;
 
         let stat = self.get_file_attr(&path).await?;
         inode_map.insert_path(stat.ino, path.clone());
@@ -565,14 +575,15 @@ impl AsyncFileSystemImpl for HookFs {
             let parent_path = inode_map.get_path(parent)?;
             parent_path.join(name)
         };
+        let rel =  self.relative_path(path.clone())?;
 
         let stat = self.get_file_attr(&path).await?;
 
-        trace!("unlinking {}", path.display());
-        async_unlink(&path).await?;
+        trace!("unlinking {}", rel.display());
+        async_unlinkat(self.dir_handle, &rel, UnlinkatFlags::NoRemoveDir).await?;
 
         trace!("remove {:x} from inode_map", &stat.ino);
-        inode_map.remove_path(stat.ino, &path);
+        inode_map.remove_path(stat.ino, path);
 
         Ok(())
     }
@@ -587,11 +598,10 @@ impl AsyncFileSystemImpl for HookFs {
             let parent_path = inode_map.get_path(parent)?;
             parent_path.join(name)
         };
-
         let stat = self.get_file_attr(&path).await?;
 
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
-        async_rmdir(cpath).await?;
+        let rel = self.relative_path(path.clone())?;
+        async_unlinkat(self.dir_handle, &rel, UnlinkatFlags::RemoveDir).await?;
 
         trace!("remove {:x} from inode_map", &stat.ino);
         inode_map.remove_path(stat.ino, &path);
@@ -619,11 +629,13 @@ impl AsyncFileSystemImpl for HookFs {
 
         trace!("create symlink: {} => {}", path.display(), link.display());
 
-        let path_clone = path.clone();
-        spawn_blocking(move || symlinkat(&link, None, &path_clone)).await??;
+        let rel = self.relative_path(path.clone())?;
+        let rel_clone = rel.clone();
+        let dir_handle = self.dir_handle;
+        spawn_blocking(move || symlinkat(&link, Some(dir_handle), &rel_clone)).await??;
 
         trace!("setting owner {}:{}", uid, gid);
-        async_lchown(&path, Some(uid), Some(gid)).await?;
+        async_fchownat(self.dir_handle, &rel, Some(uid), Some(gid)).await?;
 
         let stat = self.get_file_attr(&path).await?;
         inode_map.insert_path(stat.ino, path.clone());
@@ -666,9 +678,16 @@ impl AsyncFileSystemImpl for HookFs {
             new_path.display()
         );
 
-        let new_path_clone = new_path.clone();
-        let old_path_clone = old_path.clone();
-        spawn_blocking(move || renameat(None, &old_path_clone, None, &new_path_clone)).await??;
+        let dir_fd = self.dir_handle;
+        let old_rel = self.relative_path(old_path.clone())?;
+        let new_rel = self.relative_path(new_path.clone())?;
+        trace!(
+            "rename relative from {} to {}",
+            old_rel.display(),
+            new_rel.display()
+        );
+
+        spawn_blocking(move || renameat(Some(dir_fd), &old_rel, Some(dir_fd), &new_rel)).await??;
 
         let stat = self.get_file_attr(&new_path).await?;
         trace!("remove ({:x}, {})", stat.ino, old_path.display());
@@ -695,13 +714,16 @@ impl AsyncFileSystemImpl for HookFs {
             original_path.display()
         );
 
-        let new_path_clone = new_path.clone();
+        let dir_fd = self.dir_handle;
+        let new_rel = self.relative_path(&new_path)?;
+        let original_rel = self.relative_path(&original_path)?;
+
         spawn_blocking(move || {
             linkat(
-                None,
-                &original_path,
-                None,
-                &new_path_clone,
+                Some(dir_fd),
+                &original_rel,
+                Some(dir_fd),
+                &new_rel,
                 LinkatFlags::NoSymlinkFollow,
             )
         })
@@ -735,10 +757,11 @@ impl AsyncFileSystemImpl for HookFs {
 
         trace!("open with flags: {:?}", filtered_flags);
 
-        let fd = async_open(path, filtered_flags, stat::Mode::S_IRWXU).await?;
+        let rel = self.relative_path(path)?;
+        let fd = async_openat(self.dir_handle, &rel, filtered_flags, stat::Mode::empty()).await?;
         let fh = self.opened_files.write().await.insert(File::new(fd, path)) as u64;
 
-        trace!("return with fh: {}, flags: {}", fh, 0);
+        debug!("open: return with fh: {}, flags: {}", fh, 0);
 
         let mut reply = Open::new(fh, 0);
         inject_reply!(self, OPEN, path, reply, Open);
@@ -764,7 +787,7 @@ impl AsyncFileSystemImpl for HookFs {
         let buf = async_read(file.fd, size as usize, offset).await?;
 
         let mut reply = Data::new(buf);
-        inject_reply!(self, READ, &file.original_path(), reply, Data);
+        inject_reply!(self, READ, &file.path(), reply, Data);
         Ok(reply)
     }
 
@@ -787,7 +810,7 @@ impl AsyncFileSystemImpl for HookFs {
 
         let size = async_write(file.fd, data, offset).await?;
         let mut reply = Write::new(size as u32);
-        inject_reply!(self, WRITE, file.original_path(), reply, Write);
+        inject_reply!(self, WRITE, file.path(), reply, Write);
         Ok(reply)
     }
 
@@ -851,12 +874,11 @@ impl AsyncFileSystemImpl for HookFs {
         let filtered_flags = flags & (!libc::O_APPEND);
         let filtered_flags = OFlag::from_bits_truncate(filtered_flags);
 
-        let path_clone = path.clone();
-        let dir = spawn_blocking(move || {
-            trace!("opening directory {}", path_clone.display());
-            dir::Dir::open(&path_clone, filtered_flags, stat::Mode::S_IRWXU)
-        })
-        .await??;
+        trace!("opening directory {}", path.display());
+        let rel = self.relative_path(path.clone())?;
+        let dir_fd = async_openat(self.dir_handle, &rel, filtered_flags, stat::Mode::empty()).await?;
+        let dir = dir::Dir::from_fd(dir_fd)?;
+
         trace!("directory {} opened", path.display());
         let fh = self.opened_dirs.write().await.insert(Dir::new(dir, &path)) as u64;
         trace!("return with fh: {}, flags: {}", fh, flags);
@@ -918,17 +940,21 @@ impl AsyncFileSystemImpl for HookFs {
     }
 
     #[instrument(skip(self))]
-    async fn fsyncdir(&self, ino: u64, _fh: u64, _datasync: bool) -> Result<()> {
+    async fn fsyncdir(&self, ino: u64, fh: u64, _datasync: bool) -> Result<()> {
         // TODO: inject
 
-        let inode_map = self.inode_map.read().await;
-        let path = inode_map.get_path(ino)?.to_owned();
-        spawn_blocking(move || -> Result<_> {
-            std::fs::File::open(path)?.sync_all()?;
+        let path;
+            let inode_map = self.inode_map.read().await;
+            path = inode_map.get_path(ino)?.to_owned();
 
+        let rel = self.relative_path(&path)?;
+        let fd = async_openat(self.dir_handle, &rel, OFlag::O_DIRECTORY, stat::Mode::empty()).await?;
+        spawn_blocking(move || -> Result<_> {
+            fsync(fd)?;
             Ok(())
-        })
-        .await??;
+        }).await??;
+        async_close(fd).await?;
+
         Ok(())
     }
 
@@ -939,9 +965,16 @@ impl AsyncFileSystemImpl for HookFs {
 
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?.to_owned();
+        let rel = self.relative_path(&path)?;
 
-        let origin_path = self.original_path.clone();
-        let stat = spawn_blocking(move || statfs::statfs(&origin_path)).await??;
+        let dir_handle = self.dir_handle;
+        let fd = async_openat(dir_handle, &rel, OFlag::O_PATH, stat::Mode::empty()).await?;
+        let stat = {
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+            let stat = spawn_blocking(move || statfs::fstatfs(borrowed_fd)).await??;
+            async_close(fd).await?;
+            stat
+        };
 
         let mut reply = StatFs::new(
             stat.blocks(),
@@ -972,10 +1005,14 @@ impl AsyncFileSystemImpl for HookFs {
 
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?.to_owned();
-        let path = CString::new(path.as_os_str().as_bytes())?;
-        let name = CString::new(name.as_bytes())?;
 
-        async_setxattr(path, name, value, flags).await?;
+        let rel = self.relative_path(path)?;
+        let fd = async_openat(self.dir_handle, &rel, OFlag::O_RDONLY, stat::Mode::empty()).await?;
+
+        let name = CString::new(name.as_bytes())?;
+        async_fsetxattr(fd, name, value, flags).await?;
+
+        async_close(fd).await?;
 
         Ok(())
     }
@@ -987,10 +1024,14 @@ impl AsyncFileSystemImpl for HookFs {
 
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?;
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
-        let name = CString::new(name.as_bytes())?;
 
-        let data = async_getxattr(cpath, name, size as usize).await?;
+        let rel = self.relative_path(path)?;
+        let fd = async_openat(self.dir_handle, &rel, OFlag::O_RDONLY, stat::Mode::empty()).await?;
+
+        let name = CString::new(name.as_bytes())?;
+        let data = async_fgetxattr(fd, name, size as usize).await?;
+
+        async_close(fd).await?;
 
         let mut reply = if size == 0 {
             trace!("return with size {}", data.len());
@@ -1011,19 +1052,22 @@ impl AsyncFileSystemImpl for HookFs {
 
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?.to_owned();
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
 
         let buf = vec![0u8; size as usize];
 
         let shared_buf = std::sync::Arc::new(buf);
         let buf_clone = shared_buf.clone();
 
+        let rel = self.relative_path(path.clone())?;
+        let fd = async_openat(self.dir_handle, &rel, OFlag::O_RDONLY, stat::Mode::empty()).await?;
+
         let ret = spawn_blocking(move || {
-            let path_ptr = &cpath.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
             let buf_ptr = buf_clone.as_slice() as *const [u8] as *mut [u8] as *mut libc::c_char;
-            unsafe { llistxattr(path_ptr, buf_ptr, size as usize) }
+            unsafe { flistxattr(fd, buf_ptr, size as usize) }
         })
         .await?;
+
+        async_close(fd).await?;
 
         if ret == -1 {
             return Err(Error::last());
@@ -1034,7 +1078,7 @@ impl AsyncFileSystemImpl for HookFs {
         } else {
             Xattr::data(shared_buf.as_slice().to_owned())
         };
-        inject_reply!(self, LISTXATTR, path, reply, Xattr);
+        inject_reply!(self, LISTXATTR, &path, reply, Xattr);
 
         Ok(reply)
     }
@@ -1046,15 +1090,18 @@ impl AsyncFileSystemImpl for HookFs {
 
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?.to_owned();
-        let path = CString::new(path.as_os_str().as_bytes())?;
         let name = CString::new(name.as_bytes())?;
 
+        let rel = self.relative_path(path)?;
+        let fd = async_openat(self.dir_handle, &rel, OFlag::O_RDONLY, stat::Mode::empty()).await?;
+
         let ret = spawn_blocking(move || {
-            let path_ptr = &path.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
             let name_ptr = &name.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
-            unsafe { lremovexattr(path_ptr, name_ptr) }
+            unsafe { fremovexattr(fd, name_ptr) }
         })
         .await?;
+
+        async_close(fd).await?;
 
         if ret == -1 {
             return Err(Error::last());
@@ -1069,10 +1116,15 @@ impl AsyncFileSystemImpl for HookFs {
 
         let inode_map = self.inode_map.read().await;
         let path = inode_map.get_path(ino)?.to_owned();
-        let mask = AccessFlags::from_bits_truncate(mask);
-        let path_clone = path.to_path_buf();
+        let rel = self.relative_path(&path)?;
+        let cpath = CString::new(rel.as_os_str().as_bytes())?;
+        let mask = AccessFlags::from_bits_truncate(mask).bits();
+        let dir_fd = self.dir_handle;
 
-        spawn_blocking(move || nix::unistd::access(&path_clone, mask)).await??;
+        spawn_blocking(move || unsafe {
+            let path_ptr = &cpath.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
+            libc::faccessat(dir_fd, path_ptr, mask, 0)
+        }).await?;
 
         Ok(())
     }
@@ -1102,9 +1154,10 @@ impl AsyncFileSystemImpl for HookFs {
         let mode = stat::Mode::from_bits_truncate(mode);
 
         trace!("create with flags: {:?}, mode: {:?}", filtered_flags, mode);
-        let fd = async_open(&path, filtered_flags, mode).await?;
+        let rel = self.relative_path(path.clone())?;
+        let fd = async_openat(self.dir_handle, &rel, filtered_flags, mode).await?;
         trace!("setting owner {}:{} for file", uid, gid);
-        async_lchown(&path, Some(uid), Some(gid)).await?;
+        async_fchownat(self.dir_handle, &rel, Some(uid), Some(gid)).await?;
 
         let stat = self.get_file_attr(&path).await?;
         let fh = self.opened_files.write().await.insert(File::new(fd, &path));
@@ -1116,6 +1169,7 @@ impl AsyncFileSystemImpl for HookFs {
         inode_map.increase_ref(stat.ino);
         let mut reply = Create::new(stat, 0, fh as u64, flags);
         inject_reply!(self, CREATE, path.as_path(), reply, Create);
+        debug!("create: return with fh: {}", reply.fh);
         Ok(reply)
     }
 
@@ -1158,36 +1212,34 @@ impl AsyncFileSystemImpl for HookFs {
     }
 }
 
-async fn async_setxattr(path: CString, name: CString, data: Vec<u8>, flags: i32) -> Result<()> {
-    spawn_blocking(move || {
-        let path_ptr = &path.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
-        let name_ptr = &name.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
-        let data_ptr = &data[0] as *const u8 as *const libc::c_void;
-        let ret = unsafe { lsetxattr(path_ptr, name_ptr, data_ptr, data.len(), flags) };
-
-        if ret == -1 {
-            Err(Error::last())
-        } else {
-            Ok(())
-        }
-    })
-    .await?
-}
-
-async fn async_getxattr(path: CString, name: CString, size: usize) -> Result<Vec<u8>> {
+async fn async_fgetxattr(fd: RawFd, name: CString, size: usize) -> Result<Vec<u8>> {
     spawn_blocking(move || {
         let mut buf = vec![0; size];
 
-        let path_ptr = &path.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
         let name_ptr = &name.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
         let buf_ptr = buf.as_slice() as *const [u8] as *mut [u8] as *mut libc::c_void;
 
-        let ret = unsafe { lgetxattr(path_ptr, name_ptr, buf_ptr, size) };
+        let ret = unsafe { fgetxattr(fd, name_ptr, buf_ptr, size as usize) };
         if ret == -1 {
             Err(Error::last())
         } else {
             buf.resize(ret as usize, 0);
             Ok(buf)
+        }
+    })
+    .await?
+}
+
+async fn async_fsetxattr(fd: RawFd, name: CString, data: Vec<u8>, flags:i32) -> Result<()> {
+    spawn_blocking(move || {
+        let name_ptr = &name.as_bytes_with_nul()[0] as *const u8 as *const libc::c_char;
+        let data_ptr = &data[0] as *const u8 as *const libc::c_void;
+        let ret = unsafe { fsetxattr(fd, name_ptr, data_ptr, data.len(), flags) };
+
+        if ret == -1 {
+            Err(Error::last())
+        } else {
+            Ok(())
         }
     })
     .await?
@@ -1219,17 +1271,17 @@ async fn async_write(fd: RawFd, data: Vec<u8>, offset: i64) -> Result<isize> {
     .await?
 }
 
-async fn async_stat(path: &Path) -> Result<stat::FileStat> {
+async fn async_stat(dir: RawFd, path: &Path) -> Result<stat::FileStat> {
     let path_clone = path.to_path_buf();
     trace!("async read stat from path {}", path_clone.display());
-    Ok(spawn_blocking(move || stat::lstat(&path_clone)).await??)
+    Ok(spawn_blocking(move || nix::sys::stat::fstatat(dir, &path_clone, AtFlags::AT_SYMLINK_NOFOLLOW,)).await??)
 }
 
-async fn async_lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+async fn async_fchownat(dir: RawFd, path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
     let path_clone = path.to_path_buf();
     spawn_blocking(move || {
         fchownat(
-            None,
+            Some(dir),
             &path_clone,
             uid.map(Uid::from_raw),
             gid.map(Gid::from_raw),
@@ -1240,11 +1292,11 @@ async fn async_lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> Result
     Ok(())
 }
 
-async fn async_fchmodat(path: &Path, mode: u32) -> Result<()> {
+async fn async_fchmodat(dir: RawFd, path: &Path, mode: u32) -> Result<()> {
     let path_clone = path.to_path_buf();
     spawn_blocking(move || {
         stat::fchmodat(
-            None,
+            Some(dir),
             &path_clone,
             stat::Mode::from_bits_truncate(mode),
             stat::FchmodatFlags::FollowSymlink,
@@ -1254,17 +1306,11 @@ async fn async_fchmodat(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-async fn async_truncate(path: &Path, len: i64) -> Result<()> {
-    let path_clone = path.to_path_buf();
-    spawn_blocking(move || truncate(&path_clone, len)).await??;
-    Ok(())
-}
-
-async fn async_utimensat(path: CString, times: [libc::timespec; 2]) -> Result<()> {
+async fn async_utimensat(dir: RawFd, path: CString, times: [libc::timespec; 2]) -> Result<()> {
     spawn_blocking(move || unsafe {
         let path_ptr = &path.as_bytes_with_nul()[0] as *const u8 as *mut i8;
         let ret = libc::utimensat(
-            0,
+            dir,
             path_ptr,
             &times as *const [libc::timespec; 2] as *const libc::timespec,
             libc::AT_SYMLINK_NOFOLLOW,
@@ -1280,15 +1326,15 @@ async fn async_utimensat(path: CString, times: [libc::timespec; 2]) -> Result<()
     Ok(())
 }
 
-async fn async_readlink(path: &Path) -> Result<OsString> {
+async fn async_readlinkat(dir: RawFd, path: &Path) -> Result<OsString> {
     let path_clone = path.to_path_buf();
-    Ok(spawn_blocking(move || readlink(&path_clone)).await??)
+    Ok(spawn_blocking(move || nix::fcntl::readlinkat(dir, &path_clone)).await??)
 }
 
-async fn async_mknod(path: CString, mode: u32, rdev: u64) -> Result<()> {
+async fn async_mknodat(dir: RawFd, path: CString, mode: u32, rdev: u64) -> Result<()> {
     spawn_blocking(move || {
         let path_ptr = &path.as_bytes_with_nul()[0] as *const u8 as *mut i8;
-        let ret = unsafe { libc::mknod(path_ptr, mode, rdev) };
+        let ret = unsafe { libc::mknodat(dir, path_ptr, mode, rdev) };
 
         if ret != 0 {
             Err(Error::last())
@@ -1299,35 +1345,21 @@ async fn async_mknod(path: CString, mode: u32, rdev: u64) -> Result<()> {
     .await?
 }
 
-async fn async_mkdir(path: &Path, mode: stat::Mode) -> Result<()> {
+async fn async_mkdirat(dir: RawFd, path: &Path, mode: stat::Mode) -> Result<()> {
     let path_clone = path.to_path_buf();
-    spawn_blocking(move || mkdir(&path_clone, mode)).await??;
+    spawn_blocking(move || stat::mkdirat(dir, &path_clone, mode)).await??;
     Ok(())
 }
 
-async fn async_unlink(path: &Path) -> Result<()> {
+async fn async_unlinkat(dir: RawFd, path: &Path, flags: UnlinkatFlags) -> Result<()> {
     let path_clone = path.to_path_buf();
-    spawn_blocking(move || unlink(&path_clone)).await??;
+    spawn_blocking(move || nix::unistd::unlinkat(Some(dir), &path_clone, flags)).await??;
     Ok(())
 }
 
-async fn async_rmdir(path: CString) -> Result<()> {
-    spawn_blocking(move || {
-        let path_ptr = &path.as_bytes_with_nul()[0] as *const u8 as *mut i8;
-        let ret = unsafe { libc::rmdir(path_ptr) };
-
-        if ret != 0 {
-            Err(Error::last())
-        } else {
-            Ok(())
-        }
-    })
-    .await?
-}
-
-async fn async_open(path: &Path, filtered_flags: OFlag, mode: stat::Mode) -> Result<RawFd> {
+async fn async_openat(dir: RawFd, path: &Path, filtered_flags: OFlag, mode: stat::Mode) -> Result<RawFd> {
     let path_clone = path.to_path_buf();
-    let fd = spawn_blocking(move || open(&path_clone, filtered_flags, mode)).await??;
+    let fd = spawn_blocking(move || { openat(dir, &path_clone, filtered_flags, mode) }).await??;
     Ok(fd)
 }
 

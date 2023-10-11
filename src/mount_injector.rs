@@ -5,6 +5,8 @@ use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
 use nix::mount::umount;
+use nix::fcntl::{open, OFlag};
+use nix::sys::stat::Mode;
 use retry::delay::Fixed;
 use retry::{retry, OperationResult};
 use tracing::info;
@@ -14,14 +16,12 @@ use crate::{hookfs, mount, stop};
 
 #[derive(Debug)]
 pub struct MountInjector {
-    original_path: PathBuf,
-    new_path: PathBuf,
+    mount_point: PathBuf,
     injector_config: Vec<InjectorConfig>,
 }
 
 pub struct MountInjectionGuard {
-    original_path: PathBuf,
-    new_path: PathBuf,
+    mount_point: PathBuf,
     pub hookfs: Arc<hookfs::HookFs>,
     handler: Option<JoinHandle<Result<()>>>,
 }
@@ -36,7 +36,7 @@ impl MountInjectionGuard {
     }
 
     pub fn recover_mount(mut self) -> Result<()> {
-        let mount_point = self.original_path.clone();
+        let mount_point = self.mount_point.clone();
 
         retry(Fixed::from_millis(500).take(20), || {
             if let Err(err) = umount(mount_point.as_path()) {
@@ -54,18 +54,6 @@ impl MountInjectionGuard {
             .join()
             .unwrap()?;
 
-        let new_path = self.new_path.clone();
-        let original_path = self.original_path;
-
-        let mounts = mount::MountsInfo::parse_mounts()?;
-
-        if mounts.non_root(&original_path)? {
-            // TODO: make the parent mount points private before move mount points
-            mounts.move_mount(new_path, original_path)?;
-        } else {
-            return Err(anyhow!("inject on a root mount"));
-        }
-
         Ok(())
     }
 }
@@ -82,53 +70,38 @@ impl MountInjector {
             return Err(anyhow!("path is the root"));
         }
 
-        let mut new_path: PathBuf = base_path;
-        let original_filename = original_path
-            .file_name()
-            .ok_or(anyhow!("the path terminates in `..` or `/`"))?
-            .to_str()
-            .ok_or(anyhow!("path with non-UTF-8 character"))?;
-        let new_filename = format!("__chaosfs__{}__", original_filename);
-        new_path.push(new_filename.as_str());
-
         Ok(MountInjector {
-            original_path,
-            new_path,
+            mount_point: original_path,
             injector_config,
         })
     }
 
     // This method should be called in host namespace
     pub fn mount(&mut self) -> Result<MountInjectionGuard> {
-        let original_path = self.original_path.clone();
-        let new_path = self.new_path.clone();
+        let mount_point = self.mount_point.clone();
 
         let mounts = mount::MountsInfo::parse_mounts()?;
 
-        if mounts.non_root(&original_path)? {
-            // TODO: make the parent mount points private before move mount points
-            mounts.move_mount(original_path, new_path)?;
-        } else {
+        if !mounts.non_root(&mount_point)? {
             return Err(anyhow!("inject on a root mount"));
         }
+
+        let dir_handle = open(&self.mount_point, OFlag::O_DIRECTORY | OFlag::O_PATH, Mode::empty())?;
 
         let injectors = MultiInjector::build(self.injector_config.clone())?;
 
         let hookfs = Arc::new(hookfs::HookFs::new(
-            &self.original_path,
-            &self.new_path,
+            &self.mount_point,
             injectors,
+            dir_handle,
         ));
 
-        let original_path = self.original_path.clone();
-        let new_path = self.new_path.clone();
+        let original_path = self.mount_point.clone();
         let cloned_hookfs = hookfs.clone();
 
         let (before_mount_waiter, before_mount_guard) = stop::lock();
         let handler = std::thread::spawn(Box::new(move || {
             let fs = hookfs::AsyncFileSystem::from(cloned_hookfs);
-
-            std::fs::create_dir_all(new_path.as_path())?;
 
             let args = ["allow_other", "fsname=toda", "default_permissions", "nonempty"];
             let flags: Vec<_> = args
@@ -153,8 +126,7 @@ impl MountInjector {
         Ok(MountInjectionGuard {
             handler: Some(handler),
             hookfs,
-            original_path: self.original_path.clone(),
-            new_path: self.new_path.clone(),
+            mount_point: self.mount_point.clone(),
         })
     }
 }

@@ -25,7 +25,6 @@ mod mount_injector;
 mod ptrace;
 mod replacer;
 mod stop;
-mod utils;
 
 use std::convert::TryFrom;
 use std::os::unix::io::RawFd;
@@ -39,12 +38,11 @@ use jsonrpc::start_server;
 use mount_injector::{MountInjectionGuard, MountInjector};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::unistd::{pipe, read, write};
-use replacer::{Replacer, UnionReplacer};
 use structopt::StructOpt;
+use toda::replacer::{Replacer,UnionReplacer};
 use tokio::runtime::Runtime;
 use tracing::{info, instrument};
 use tracing_subscriber::EnvFilter;
-use utils::encode_path;
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "basic")]
@@ -70,7 +68,7 @@ fn inject(option: Options, injector_config: Vec<InjectorConfig>) -> Result<Mount
 
     let replacer = if !option.mount_only {
         let mut replacer = UnionReplacer::default();
-        replacer.prepare(&path, &path)?;
+        replacer.prepare(&path)?;
 
         Some(replacer)
     } else {
@@ -86,9 +84,8 @@ fn inject(option: Options, injector_config: Vec<InjectorConfig>) -> Result<Mount
     info!("mount successfully");
 
     if let Some(mut replacer) = replacer {
-        // At this time, `mount --move` has already been executed.
         // Our FUSE are mounted on the "path", so we
-        replacer.run()?;
+        replacer.after_mount()?;
         drop(replacer);
         info!("replacer detached");
     }
@@ -108,27 +105,29 @@ fn resume(option: Options, mount_guard: MountInjectionGuard) -> Result<()> {
 
     info!("canonicalizing path {}", path.display());
     let path = path.canonicalize()?;
-    let (_, new_path) = encode_path(&path)?;
 
-    let replacer = if !option.mount_only {
+    let mut replacer = if !option.mount_only {
         let mut replacer = UnionReplacer::default();
-        replacer.prepare(&path, &new_path)?;
-        info!("running replacer");
-        let result = replacer.run();
-        info!("replace result: {:?}", result);
-
+        replacer.prepare(&path)?;
         Some(replacer)
     } else {
         None
     };
 
+    if let Some(ref mut replacer) = replacer {
+        replacer.before_unmount()?;
+    }
+
     info!("recovering mount");
     mount_guard.recover_mount()?;
+
+    if let Some(ref mut replacer) = replacer {
+        replacer.after_unmount()?;
+    }
 
     info!("replacers detached");
     info!("recover successfully");
 
-    drop(replacer);
     Ok(())
 }
 

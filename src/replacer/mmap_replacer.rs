@@ -24,7 +24,7 @@ struct ReplaceCase {
     pub offset: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(packed)]
 #[repr(C)]
 struct RawReplaceCase {
@@ -34,6 +34,7 @@ struct RawReplaceCase {
     flags: u64,
     new_path_offset: u64,
     offset: u64,
+    new_mapped_addr: u64,
 }
 
 impl RawReplaceCase {
@@ -52,6 +53,7 @@ impl RawReplaceCase {
             flags,
             new_path_offset,
             offset,
+            new_mapped_addr: 0,
         }
     }
 }
@@ -148,18 +150,106 @@ impl Debug for ProcessAccessor {
 }
 
 impl ProcessAccessor {
-    pub fn run(&mut self) -> anyhow::Result<()> {
+    fn unmap(&mut self) -> anyhow::Result<()> {
+        trace!("self.cases: {:X?}", self.cases);
+
+        let cases = &mut *self.cases.clone();
+        let length = cases.len();
+        let cases_ptr = &mut cases[0] as *mut RawReplaceCase as *mut u8;
+        let size = std::mem::size_of_val(cases);
+        let cases = unsafe { std::slice::from_raw_parts(cases_ptr, size) };
+
+        let code = |addr| {
+            let mut vec_rt =
+                dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(addr as usize);
+            dynasm!(vec_rt
+                ; .arch x64
+                ; ->cases:
+                ; .bytes cases
+                ; ->cases_length:
+                ; .qword cases.len() as i64
+                ; nop
+                ; nop
+            );
+
+            trace!("static bytes placed");
+            let replace = vec_rt.offset();
+            dynasm!(vec_rt
+                ; .arch x64
+                // set r15 to 0
+                ; xor r15, r15
+                ; lea r14, [-> cases]
+
+                ; jmp ->end
+                ; ->start:
+                // munmap
+                ; mov rax, 0x0B
+                ; mov rdi, QWORD [r14+r15] // addr
+                ; mov rsi, QWORD [r14+r15+8] // length
+                ; mov rdx, 0x0
+                ; syscall
+
+                // mmap a temporary anonymous mapping to hold the address
+                ; mov rax, 0x9
+                ; mov rdi, QWORD [r14+r15] // addr
+                ; mov rsi, QWORD [r14+r15+8] // length
+                ; mov rdx, QWORD [r14+r15+16] // prot
+                ; mov r10, 34 // flags = MAP_PRIVATE | MAP_ANON
+                ; xor r8, r8 // fd
+                ; xor r9, r9 // offset
+                ; syscall
+                ; mov QWORD [r14+r15+48], rax
+
+                ; add r15, std::mem::size_of::<RawReplaceCase>() as i32
+                ; ->end:
+                ; mov r13, QWORD [->cases_length]
+                ; cmp r15, r13
+                ; jb ->start
+
+                ; int3
+            );
+
+            let instructions = vec_rt.finalize()?;
+
+            Ok((replace.0 as u64, instructions))
+        };
+
+        let mut content = vec![0u8; size];
+        let content = content.as_mut_slice();
+        self.process.run_codes(Some(content), code)?;
+
+        let content_ptr= content.as_ptr();
+        let cases = unsafe { std::slice::from_raw_parts(content_ptr as *const RawReplaceCase, length) };
+
+        self.cases = cases.to_vec();
+        trace!("after remap, self.cases: {:X?}", self.cases);
+
+        let mismatched : Vec<_> = self.cases.iter().filter(|case| case.memory_addr != case.new_mapped_addr).collect();
+        if mismatched.len() > 0 {
+            error!("mismatched cases: {:X?}", mismatched);
+            return Err(anyhow!("some maps not restored with original address"));
+        }
+
+        trace!("unmap successful");
+        Ok(())
+    }
+
+    fn remap(&mut self) -> anyhow::Result<()> {
         self.new_paths.set_position(0);
 
         let mut new_paths = Vec::new();
         self.new_paths.read_to_end(&mut new_paths)?;
 
+        trace!("self.cases: {:X?}", self.cases);
+
         let cases = &mut *self.cases.clone();
+        let length = cases.len();
         let cases_ptr = &mut cases[0] as *mut RawReplaceCase as *mut u8;
         let size = std::mem::size_of_val(cases);
         let cases = unsafe { std::slice::from_raw_parts(cases_ptr, size) };
 
-        self.process.run_codes(|addr| {
+        let code = |addr| {
+
             let mut vec_rt =
                 dynasmrt::VecAssembler::<dynasmrt::x64::X64Relocation>::new(addr as usize);
             dynasm!(vec_rt
@@ -184,40 +274,35 @@ impl ProcessAccessor {
 
                 ; jmp ->end
                 ; ->start:
-                // munmap
-                ; mov rax, 0x0B
-                ; mov rdi, QWORD [r14+r15] // addr
-                ; mov rsi, QWORD [r14+r15+8] // length
-                ; mov rdx, 0x0
-                ; syscall
                 // open
                 ; mov rax, 0x2
-
                 ; lea rdi, [-> new_paths]
-                ; add r15, 8 * 4 // set r15 to point to path
-                ; add rdi, QWORD [r14+r15] // path
-                ; sub r15, 8 * 4
-
+                ; add rdi, QWORD [r14+r15+32] // path
                 ; mov rsi, libc::O_RDWR
                 ; mov rdx, 0x0
                 ; syscall
-                ; push rax
-                ; mov r8, rax // fd
+                ; mov r12, rax
+
+                // munmap temporary anonymous mapping
+                ; mov rax, 0x0B
+                ; mov rdi, QWORD [r14+r15] // addr
+                ; mov rsi, QWORD [r14+r15+8] // length
+                ; syscall
+
                 // mmap
                 ; mov rax, 0x9
-                ; add r15, 8
-                ; mov rsi, QWORD [r14+r15] // length
-                ; add r15, 8
-                ; mov rdx, QWORD [r14+r15] // prot
-                ; add r15, 8
-                ; mov r10, QWORD [r14+r15] // flags
-                ; add r15, 16
-                ; mov r9, QWORD [r14+r15] // offset
+                ; mov rdi, QWORD [r14+r15] // addr
+                ; mov rsi, QWORD [r14+r15+8] // length
+                ; mov rdx, QWORD [r14+r15+16] // prot
+                ; mov r10, QWORD [r14+r15+24] // flags
+                ; mov r8, r12 // fd
+                ; mov r9, QWORD [r14+r15+40] // offset
                 ; syscall
-                ; sub r15, 8 * 5
+                ; mov QWORD [r14+r15+48], rax
+
                 // close
                 ; mov rax, 0x3
-                ; pop rdi
+                ; mov rdi, r12
                 ; syscall
 
                 ; add r15, std::mem::size_of::<RawReplaceCase>() as i32
@@ -232,9 +317,25 @@ impl ProcessAccessor {
             let instructions = vec_rt.finalize()?;
 
             Ok((replace.0 as u64, instructions))
-        })?;
+        };
 
-        trace!("reopen successfully");
+        let mut content = vec![0u8; size];
+        let content = content.as_mut_slice();
+        self.process.run_codes(Some(content), code)?;
+
+        let content_ptr= content.as_ptr();
+        let cases = unsafe { std::slice::from_raw_parts(content_ptr as *const RawReplaceCase, length) };
+
+        self.cases = cases.to_vec();
+        trace!("after remap, self.cases: {:X?}", self.cases);
+
+        let mismatched : Vec<_> = self.cases.iter().filter(|case| case.memory_addr != case.new_mapped_addr).collect();
+        if mismatched.len() > 0 {
+            error!("mismatched cases: {:X?}", mismatched);
+            return Err(anyhow!("some maps not restored with original address"));
+        }
+
+        trace!("remap successful");
         Ok(())
     }
 }
@@ -271,14 +372,12 @@ pub struct MmapReplacer {
 }
 
 impl MmapReplacer {
-    pub fn prepare<P1: AsRef<Path>, P2: AsRef<Path>>(
+    pub fn prepare<P1: AsRef<Path>>(
         detect_path: P1,
-        new_path: P2,
     ) -> Result<MmapReplacer> {
         info!("preparing mmap replacer");
 
         let detect_path = detect_path.as_ref();
-        let new_path = new_path.as_ref();
 
         let processes = all_processes()?
             .filter_map(|process| -> Option<_> {
@@ -313,11 +412,6 @@ impl MmapReplacer {
                         }
                     })
                     .filter(|(_, case)| case.path.starts_with(detect_path))
-                    .filter_map(|(process, mut case)| {
-                        let stripped_path = case.path.strip_prefix(detect_path).ok()?;
-                        case.path = new_path.join(stripped_path);
-                        Some((process, case))
-                    })
             })
             .group_by(|(process, _)| process.pid)
             .into_iter()
@@ -341,12 +435,28 @@ impl MmapReplacer {
 }
 
 impl Replacer for MmapReplacer {
-    fn run(&mut self) -> Result<()> {
-        info!("running mmap replacer");
+    fn after_mount(&mut self) -> Result<()> {
+        info!("replacing mmap'd files");
         for (_, accessor) in self.processes.iter_mut() {
-            accessor.run()?;
+            accessor.unmap()?;
+            accessor.remap()?;
         }
+        Ok(())
+    }
 
+    fn before_unmount(&mut self) -> Result<()> {
+        info!("unmapping mmap'd files");
+        for (_, accessor) in self.processes.iter_mut() {
+            accessor.unmap()?;
+        }
+        Ok(())
+    }
+
+    fn after_unmount(&mut self) -> Result<()> {
+        info!("remapping mmap'd files");
+        for (_, accessor) in self.processes.iter_mut() {
+            accessor.remap()?;
+        }
         Ok(())
     }
 }

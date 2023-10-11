@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use tracing::{error, info, trace};
+use tracing::{info, trace};
 
 use super::utils::all_processes;
 use super::{ptrace, Replacer};
@@ -13,9 +13,8 @@ pub struct CwdReplacer {
 }
 
 impl CwdReplacer {
-    pub fn prepare<P1: AsRef<Path>, P2: AsRef<Path>>(
+    pub fn prepare<P1: AsRef<Path>>(
         detect_path: P1,
-        new_path: P2,
     ) -> Result<CwdReplacer> {
         info!("preparing cmdreplacer");
 
@@ -33,17 +32,8 @@ impl CwdReplacer {
                 }
             })
             .filter(|(_, path)| path.starts_with(detect_path.as_ref()))
-            .filter_map(|(pid, path)| match ptrace::trace(pid) {
-                Ok(process) => {
-                    let mut new_path = new_path.as_ref().to_path_buf();
-
-                    new_path.push(path.strip_prefix(detect_path.as_ref()).unwrap());
-                    Some((process, new_path))
-                }
-                Err(err) => {
-                    error!("fail to ptrace process: pid({}) with error: {:?}", pid, err);
-                    None
-                }
+            .filter_map(|(pid, path)| {
+                Some((ptrace::trace(pid).ok()?, path))
             })
             .collect();
 
@@ -52,11 +42,31 @@ impl CwdReplacer {
 }
 
 impl Replacer for CwdReplacer {
-    fn run(&mut self) -> Result<()> {
+    fn after_mount(&mut self) -> Result<()> {
         info!("running cwd replacer");
-        for (process, new_path) in self.processes.iter() {
-            trace!("replacing cwd: {} to {:?}", process.pid, new_path);
-            process.chdir(new_path)?;
+        for (process, path) in self.processes.iter() {
+            trace!("replacing cwd: {} to {:?}", process.pid, path);
+            process.chdir(path)?;
+        }
+
+        Ok(())
+    }
+
+    fn before_unmount(&mut self) -> Result<()> {
+        info!("setting cwd for running processes to /");
+        for (process, _) in self.processes.iter() {
+            trace!("replacing cwd: {} to /", process.pid);
+            process.chdir("/")?;
+        }
+
+        Ok(())
+    }
+
+    fn after_unmount(&mut self) -> Result<()> {
+        info!("restoring cwd for running processes");
+        for (process, path) in self.processes.iter() {
+            trace!("replacing cwd: {} to {:?}", process.pid, path);
+            process.chdir(path)?;
         }
 
         Ok(())

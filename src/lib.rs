@@ -23,4 +23,3 @@ pub mod mount_injector;
 pub mod ptrace;
 pub mod replacer;
 pub mod stop;
-pub mod utils;
