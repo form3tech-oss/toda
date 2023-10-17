@@ -215,7 +215,7 @@ impl FdReplacer {
                         return None;
                     }
                 };
-                let fd = process.fd().ok()?;
+                let fd = process.fd().ok()?.filter_map(|fd| fd.ok());
 
                 Some((traced_process, fd))
             })
